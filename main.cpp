@@ -6,18 +6,53 @@
 #include <queue>
 #include <unordered_map>
 
-using Instruction = std::unordered_map<std::string, std::string>;
+
+enum class Op { ALU, FPU, LDW, STW, BRA, BUC, BCN, CAL, RET };
+
+struct Instruction {
+    Op  op;
+    int dest;      // register number, or -1 if none
+    int src[2];    // register numbers, or -1 if unused
+};
+
+enum class State { Waiting, Ready, Executing, Done };
+
+struct RSEntry {
+    int   tag;          // unique ID for this instruction
+    Op    op;
+    int   dest;         // destination register (-1 if none)
+    int   srcTag[2];    // Qj, Qk: tag being waited on, -1 = operand ready
+    State state;
+    int   cyclesLeft;   // remaining execution latency
+};
+
+using ReservationStation = std::vector<RSEntry>;  // capacity 32
+// using LoadQueue          = std::vector<RSEntry>;  // capacity 8
+// using StoreQueue         = std::vector<RSEntry>;  // capacity 8
+
+// using Instruction = std::unordered_map<std::string, std::string>;
 using InstructionQueue = std::queue<Instruction>;
 
-using ReservationStation = std::vector<Instruction>;
-using RegisterStatus = std::unordered_map<std::string, std::string>;
-
 const std::size_t RS_MAX_SIZE = 32;
+
+// Convert an opcode string to Op. Returns false for unknown opcodes.
+bool parseOp(const std::string &s, Op &op)
+{
+    static const std::unordered_map<std::string, Op> ops = {
+        {"ALU", Op::ALU}, {"FPU", Op::FPU}, {"LDW", Op::LDW},
+        {"STW", Op::STW}, {"BRA", Op::BRA}, {"BUC", Op::BUC},
+        {"BCN", Op::BCN}, {"CAL", Op::CAL}, {"RET", Op::RET}};
+
+    auto it = ops.find(s);
+    if (it == ops.end())
+        return false;
+    op = it->second;
+    return true;
+}
 
 void fetchAndDecode(InstructionQueue &instructionQueue, std::ifstream &file, int fetch_len)
 {
     std::string line;
-    int nextTag;
 
     for (int i = 0; i < fetch_len && std::getline(file, line); i++)
     {
@@ -36,35 +71,33 @@ void fetchAndDecode(InstructionQueue &instructionQueue, std::ifstream &file, int
         if (tokenList.empty())
             continue;
 
-        InstructionQueue instr;
-        std::string op = tokenList[0];
-        instr["op"] = op;
+        Instruction instr;
+        if (!parseOp(tokenList[0], instr.op))
+            continue;
 
-        if (op == "BCN")
-        {
-            instr["dest"] = "";
-            instr["src1"] = (tokenList.size() > 1) ? tokenList[1] : "";
-            instr["src2"] = (tokenList.size() > 2) ? tokenList[2] : "";
-        }
-        else if (op == "STW")
-        {
-            instr["dest"] = "";
-            instr["src1"] = (tokenList.size() > 3) ? tokenList[3] : "";
-            instr["src2"] = (tokenList.size() > 4) ? tokenList[4] : "";
-        }
-        else if (op == "ALU" || op == "BRA")
-        {
-            instr["dest"] = (tokenList.size() > 2) ? tokenList[2] : "";
+        instr.dest = -1;
+        instr.src[0] = -1;
+        instr.src[1] = -1;
 
-            if (tokenList.size() > 4)
+        // BCN/BUC lines hold PC addresses, not registers, so they have no operands
+        if (instr.op != Op::BCN && instr.op != Op::BUC)
+        {
+            // Format: OP DEST [reg] SRC [reg] [reg]
+            // Registers after DEST are destinations, registers after SRC are sources
+            bool inSrc = false;
+            int srcCount = 0;
+
+            for (std::size_t t = 1; t < tokenList.size(); t++)
             {
-                instr["src1"] = tokenList[4];
+                if (tokenList[t] == "DEST")
+                    inSrc = false;
+                else if (tokenList[t] == "SRC")
+                    inSrc = true;
+                else if (!inSrc)
+                    instr.dest = std::stoi(tokenList[t].substr(1)); // "R12" -> 12
+                else if (srcCount < 2)
+                    instr.src[srcCount++] = std::stoi(tokenList[t].substr(1));
             }
-            else
-            {
-                instr["src1"] = "";
-            }
-            instr["src2"] = "";
         }
 
         instructionQueue.push(instr);
@@ -74,7 +107,7 @@ void fetchAndDecode(InstructionQueue &instructionQueue, std::ifstream &file, int
     std::cout << "Successfully fetched and decoded instructions.\n";
 }
 
-void issue(InstructionQueue &instructionQueue, ReservationStation &reservationStation, int width, RegisterStatus& registerStatus, int& nextTag)
+void issue(InstructionQueue &instructionQueue, ReservationStation &reservationStation, int width, int registerStatus[], int& nextTag)
 {
 
     for (int i = 0; i < width; i++)
@@ -89,7 +122,7 @@ void issue(InstructionQueue &instructionQueue, ReservationStation &reservationSt
 
         // if the instr is ALU then:
 
-        if (instruction["op"] == "ALU")
+        if (instruction.op == Op::ALU)
         {
             // Reservation station is full
             if (reservationStation.size() >= RS_MAX_SIZE)
@@ -97,31 +130,43 @@ void issue(InstructionQueue &instructionQueue, ReservationStation &reservationSt
                 return;
             }
 
-            instruction["tag"] = "T" + std::to_string(nextTag++);
-            instruction["src1Tag"] = "";
-            instruction["src2Tag"] = "";
-            instruction["src1Ready"] = "";
-            instruction["src2Ready"] = "";
+            RSEntry entry;
+            entry.tag = nextTag++;
+            entry.op = instruction.op;
+            entry.dest = instruction.dest;
+            entry.srcTag[0] = -1;      // filled in by the dependency check below
+            entry.srcTag[1] = -1;
+            entry.state = State::Waiting;
+            entry.cyclesLeft = 1;      // ALU latency (assumed 1 cycle)
 
-            // Check src1
+            // Check src1: wait on its producer's tag, or -1 if the value is already ready
+            if (instruction.src[0] != -1)
+                entry.srcTag[0] = registerStatus[instruction.src[0]];
+
             // Check src2
-            // Set READY/WAITING
-            // Update destination’s producer tag
-            // Push into reservation station
-            // Pop from instruction queue
+            if (instruction.src[1] != -1)
+                entry.srcTag[1] = registerStatus[instruction.src[1]];
 
-            reservationStation.push_back(instruction);
+            // Update destination’s producer tag (must come after the source checks,
+            // so e.g. R4 = R4 + R1 waits on the previous producer of R4, not itself)
+            if (instruction.dest != -1)
+                registerStatus[instruction.dest] = entry.tag;
+
+            // Push into reservation station
+            reservationStation.push_back(entry);
+
+            // Pop from instruction queue
             instructionQueue.pop();
         }
-        else if (instruction["op"] == "LDW")
+        else if (instruction.op == Op::LDW)
         {
             // Load Buffer
         }
-        else if (instruction["op"] == "STW")
+        else if (instruction.op == Op::STW)
         {
             // Store Buffer
         }
-        else if (instruction["op"] == "BRA" || instruction["op"] == "BCN" || instruction["op"] == "BUC")
+        else if (instruction.op == Op::BRA || instruction.op == Op::BCN || instruction.op == Op::BUC)
         {
             // Branch handling
         }
@@ -139,12 +184,18 @@ int main()
 
     InstructionQueue instructionQueue;
     ReservationStation reservationStation;
-    RegisterStatus registerStatus;
+    
+    // Tag of the in-flight instruction producing each register, -1 = value is ready
+    int registerStatus[128];
+    for (int r = 0; r < 128; r++)
+        registerStatus[r] = -1;
+
+    int nextTag = 1;
 
     int width = 4;
     fetchAndDecode(instructionQueue, file, width); // Works perfectly now
     issue(instructionQueue, reservationStation, width, registerStatus, nextTag);
-    // dispatch();
+    // dispatch(reservationStation);
     // exectue();
     // writeBack();
     return 0;
