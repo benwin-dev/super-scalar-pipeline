@@ -5,6 +5,7 @@
 #include <vector>
 #include <queue>
 #include <unordered_map>
+#include <algorithm>
 
 
 enum class Op { ALU, FPU, LDW, STW, BRA, BUC, BCN, CAL, RET };
@@ -137,7 +138,7 @@ void issue(InstructionQueue &instructionQueue, ReservationStation &reservationSt
             entry.srcTag[0] = -1;      // filled in by the dependency check below
             entry.srcTag[1] = -1;
             entry.state = State::Waiting;
-            entry.cyclesLeft = 1;      // ALU latency (assumed 1 cycle)
+            entry.cyclesLeft = 2;      // ALU latency (assumed 2 cycle)
 
             // Check src1: wait on its producer's tag, or -1 if the value is already ready
             if (instruction.src[0] != -1)
@@ -173,6 +174,73 @@ void issue(InstructionQueue &instructionQueue, ReservationStation &reservationSt
     }
 }
 
+// Start executing every waiting entry whose operands are both ready.
+// There are unlimited functional units, so nothing else limits dispatch.
+void dispatch(ReservationStation &reservationStation)
+{
+    for (RSEntry &entry : reservationStation)
+    {
+        if (entry.state == State::Waiting && entry.srcTag[0] == -1 && entry.srcTag[1] == -1)
+        {
+            entry.state = State::Executing;
+        }
+    }
+}
+
+// Advance every executing entry by one cycle. Entries that finish are marked
+// Done for write back. Returns how many finished this cycle (used for IPC)
+int execute(ReservationStation &reservationStation)
+{
+    int finished = 0;
+
+    for (RSEntry &entry : reservationStation)
+    {
+        if (entry.state == State::Executing)
+        {
+            entry.cyclesLeft--;
+
+            if (entry.cyclesLeft == 0)
+            {
+                entry.state = State::Done;
+                finished++;
+            }
+        }
+    }
+
+    return finished;
+}
+
+// Retire every Done entry: broadcast its tag to waiting entries, release its
+// destination register and free its reservation station slot.
+// Not limited by the CDB, so every finished entry retires this cycle.
+void writeBack(ReservationStation &reservationStation, int registerStatus[])
+{
+    for (const RSEntry &done : reservationStation)
+    {
+        if (done.state != State::Done)
+            continue;
+
+        // Broadcast: wake up every entry waiting on this tag
+        for (RSEntry &entry : reservationStation)
+        {
+            if (entry.srcTag[0] == done.tag)
+                entry.srcTag[0] = -1;
+            if (entry.srcTag[1] == done.tag)
+                entry.srcTag[1] = -1;
+        }
+
+        // Only clear the register if no later instruction has renamed it since
+        if (done.dest != -1 && registerStatus[done.dest] == done.tag)
+            registerStatus[done.dest] = -1;
+    }
+
+    // Remove the retired entries from the reservation station
+    reservationStation.erase(
+        std::remove_if(reservationStation.begin(), reservationStation.end(),
+                       [](const RSEntry &entry) { return entry.state == State::Done; }),
+        reservationStation.end());
+}
+
 int main()
 {
     std::ifstream file("sample.trace");
@@ -195,8 +263,8 @@ int main()
     int width = 4;
     fetchAndDecode(instructionQueue, file, width); // Works perfectly now
     issue(instructionQueue, reservationStation, width, registerStatus, nextTag);
-    // dispatch(reservationStation);
-    // exectue();
-    // writeBack();
+    dispatch(reservationStation);
+    int finished = execute(reservationStation);
+    writeBack(reservationStation, registerStatus);
     return 0;
 }
