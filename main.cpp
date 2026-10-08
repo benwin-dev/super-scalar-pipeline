@@ -112,7 +112,7 @@ void fetchAndDecode(InstructionQueue &instructionQueue, std::ifstream &file, int
                 else if (tokenList[t] == "SRC")
                     inSrc = true;
                 else if (!inSrc)
-                    instr.dest = std::stoi(tokenList[t].substr(1)); // "R12" -> 12
+                    instr.dest = std::stoi(tokenList[t].substr(1));
                 else if (srcCount < 2)
                     instr.src[srcCount++] = std::stoi(tokenList[t].substr(1));
             }
@@ -200,9 +200,10 @@ void issue(InstructionQueue &instructionQueue, ReservationStation &reservationSt
 
 // Start executing every waiting entry whose operands are both ready.
 // There are unlimited functional units, so nothing else limits dispatch.
-void dispatch(ReservationStation &reservationStation)
+// Called once each for the reservation station, load queue and store queue.
+void dispatch(std::vector<RSEntry> &structure)
 {
-    for (RSEntry &entry : reservationStation)
+    for (RSEntry &entry : structure)
     {
         if (entry.state == State::Waiting && entry.srcTag[0] == -1 && entry.srcTag[1] == -1)
         {
@@ -213,11 +214,12 @@ void dispatch(ReservationStation &reservationStation)
 
 // Advance every executing entry by one cycle. Entries that finish are marked
 // Done for write back. Returns how many finished this cycle (used for IPC)
-int execute(ReservationStation &reservationStation)
+// Called once each for the reservation station, load queue and store queue.
+int execute(std::vector<RSEntry> &structure)
 {
     int finished = 0;
 
-    for (RSEntry &entry : reservationStation)
+    for (RSEntry &entry : structure)
     {
         if (entry.state == State::Executing)
         {
@@ -234,35 +236,52 @@ int execute(ReservationStation &reservationStation)
     return finished;
 }
 
-// Retire every Done entry: broadcast its tag to waiting entries, release its
-// destination register and free its reservation station slot.
-// Not limited by the CDB, so every finished entry retires this cycle.
-void writeBack(ReservationStation &reservationStation, int registerStatus[])
+// Wake up every entry in one structure that is waiting on this tag.
+void broadcast(std::vector<RSEntry> &structure, int tag)
 {
-    for (const RSEntry &done : reservationStation)
+    for (RSEntry &entry : structure)
     {
-        if (done.state != State::Done)
-            continue;
+        if (entry.srcTag[0] == tag)
+            entry.srcTag[0] = -1;
+        if (entry.srcTag[1] == tag)
+            entry.srcTag[1] = -1;
+    }
+}
 
-        // Broadcast: wake up every entry waiting on this tag
-        for (RSEntry &entry : reservationStation)
+// Retire every Done entry in all three structures: broadcast its tag to waiting
+// entries everywhere, release its destination register and free its slot.
+// Not limited by the CDB, so every finished entry retires this cycle.
+void writeBack(ReservationStation &reservationStation, LoadQueue &loadQueue,
+               StoreQueue &storeQueue, int registerStatus[])
+{
+    std::vector<RSEntry> *structures[] = {&reservationStation, &loadQueue, &storeQueue};
+
+    for (std::vector<RSEntry> *structure : structures)
+    {
+        for (const RSEntry &done : *structure)
         {
-            if (entry.srcTag[0] == done.tag)
-                entry.srcTag[0] = -1;
-            if (entry.srcTag[1] == done.tag)
-                entry.srcTag[1] = -1;
-        }
+            if (done.state != State::Done)
+                continue;
 
-        // Only clear the register if no later instruction has renamed it since
-        if (done.dest != -1 && registerStatus[done.dest] == done.tag)
-            registerStatus[done.dest] = -1;
+            // Broadcast to all structures, e.g. a finished load must wake ALU ops
+            broadcast(reservationStation, done.tag);
+            broadcast(loadQueue, done.tag);
+            broadcast(storeQueue, done.tag);
+
+            // Only clear the register if no later instruction has renamed it since
+            if (done.dest != -1 && registerStatus[done.dest] == done.tag)
+                registerStatus[done.dest] = -1;
+        }
     }
 
-    // Remove the retired entries from the reservation station
-    reservationStation.erase(
-        std::remove_if(reservationStation.begin(), reservationStation.end(),
-                       [](const RSEntry &entry) { return entry.state == State::Done; }),
-        reservationStation.end());
+    // Remove the retired entries from every structure
+    for (std::vector<RSEntry> *structure : structures)
+    {
+        structure->erase(
+            std::remove_if(structure->begin(), structure->end(),
+                           [](const RSEntry &entry) { return entry.state == State::Done; }),
+            structure->end());
+    }
 }
 
 int main()
@@ -290,7 +309,11 @@ int main()
     fetchAndDecode(instructionQueue, file, width); // Works perfectly now
     issue(instructionQueue, reservationStation, loadQueue, storeQueue, width, registerStatus, nextTag);
     dispatch(reservationStation);
+    dispatch(loadQueue);
+    dispatch(storeQueue);
     execute(reservationStation);
-    writeBack(reservationStation, registerStatus);
+    execute(loadQueue);
+    execute(storeQueue);
+    writeBack(reservationStation, loadQueue, storeQueue, registerStatus);
     return 0;
 }
