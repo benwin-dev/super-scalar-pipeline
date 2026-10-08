@@ -28,13 +28,29 @@ struct RSEntry {
 };
 
 using ReservationStation = std::vector<RSEntry>;  // capacity 32
-// using LoadQueue          = std::vector<RSEntry>;  // capacity 8
-// using StoreQueue         = std::vector<RSEntry>;  // capacity 8
+using LoadQueue          = std::vector<RSEntry>;  // capacity 8
+using StoreQueue         = std::vector<RSEntry>;  // capacity 8
 
 // using Instruction = std::unordered_map<std::string, std::string>;
 using InstructionQueue = std::queue<Instruction>;
 
 const std::size_t RS_MAX_SIZE = 32;
+const std::size_t LQ_MAX_SIZE = 8;
+const std::size_t SQ_MAX_SIZE = 8;
+
+// Execution latency in cycles for each operation.
+// The spec doesn't give these, so they are assumed values.
+int latency(Op op)
+{
+    switch (op)
+    {
+    case Op::ALU: return 2;
+    case Op::FPU: return 4;
+    case Op::LDW: return 3;
+    case Op::STW: return 2;
+    default:      return 1;   // BRA, BUC, BCN, CAL, RET
+    }
+}
 
 // Convert an opcode string to Op. Returns false for unknown opcodes.
 bool parseOp(const std::string &s, Op &op)
@@ -58,7 +74,7 @@ void fetchAndDecode(InstructionQueue &instructionQueue, std::ifstream &file, int
     for (int i = 0; i < fetch_len && std::getline(file, line); i++)
     {
         if (line.empty())
-            continue;
+            continue; // do we need to do i-- here since one itr was wasted?
 
         std::stringstream lineStream(line);
         std::vector<std::string> tokenList;
@@ -76,6 +92,7 @@ void fetchAndDecode(InstructionQueue &instructionQueue, std::ifstream &file, int
         if (!parseOp(tokenList[0], instr.op))
             continue;
 
+        // initialize it as available
         instr.dest = -1;
         instr.src[0] = -1;
         instr.src[1] = -1;
@@ -108,7 +125,9 @@ void fetchAndDecode(InstructionQueue &instructionQueue, std::ifstream &file, int
     std::cout << "Successfully fetched and decoded instructions.\n";
 }
 
-void issue(InstructionQueue &instructionQueue, ReservationStation &reservationStation, int width, int registerStatus[], int& nextTag)
+void issue(InstructionQueue &instructionQueue, ReservationStation &reservationStation,
+           LoadQueue &loadQueue, StoreQueue &storeQueue,
+           int width, int registerStatus[], int& nextTag)
 {
 
     for (int i = 0; i < width; i++)
@@ -121,56 +140,61 @@ void issue(InstructionQueue &instructionQueue, ReservationStation &reservationSt
 
         Instruction instruction = instructionQueue.front();
 
-        // if the instr is ALU then:
+        // Pick the structure this instruction goes into:
+        // loads -> load queue, stores -> store queue,
+        // everything else (ALU, FPU, branches, CAL, RET) -> reservation station
+        std::vector<RSEntry> *target;
+        std::size_t maxSize;
 
-        if (instruction.op == Op::ALU)
+        if (instruction.op == Op::LDW)
         {
-            // Reservation station is full
-            if (reservationStation.size() >= RS_MAX_SIZE)
-            {
-                return;
-            }
-
-            RSEntry entry;
-            entry.tag = nextTag++;
-            entry.op = instruction.op;
-            entry.dest = instruction.dest;
-            entry.srcTag[0] = -1;      // filled in by the dependency check below
-            entry.srcTag[1] = -1;
-            entry.state = State::Waiting;
-            entry.cyclesLeft = 2;      // ALU latency (assumed 2 cycle)
-
-            // Check src1: wait on its producer's tag, or -1 if the value is already ready
-            if (instruction.src[0] != -1)
-                entry.srcTag[0] = registerStatus[instruction.src[0]];
-
-            // Check src2
-            if (instruction.src[1] != -1)
-                entry.srcTag[1] = registerStatus[instruction.src[1]];
-
-            // Update destination’s producer tag (must come after the source checks,
-            // so e.g. R4 = R4 + R1 waits on the previous producer of R4, not itself)
-            if (instruction.dest != -1)
-                registerStatus[instruction.dest] = entry.tag;
-
-            // Push into reservation station
-            reservationStation.push_back(entry);
-
-            // Pop from instruction queue
-            instructionQueue.pop();
-        }
-        else if (instruction.op == Op::LDW)
-        {
-            // Load Buffer
+            target = &loadQueue;
+            maxSize = LQ_MAX_SIZE;
         }
         else if (instruction.op == Op::STW)
         {
-            // Store Buffer
+            target = &storeQueue;
+            maxSize = SQ_MAX_SIZE;
         }
-        else if (instruction.op == Op::BRA || instruction.op == Op::BCN || instruction.op == Op::BUC)
+        else
         {
-            // Branch handling
+            target = &reservationStation;
+            maxSize = RS_MAX_SIZE;
         }
+
+        // Target is full: stall. Issue is in order, so nothing behind it can issue either
+        if (target->size() >= maxSize)
+        {
+            return;
+        }
+
+        RSEntry entry;
+        entry.tag = nextTag++;
+        entry.op = instruction.op;
+        entry.dest = instruction.dest;
+        entry.srcTag[0] = -1;      // filled in by the dependency check below
+        entry.srcTag[1] = -1;
+        entry.state = State::Waiting;
+        entry.cyclesLeft = latency(instruction.op);
+
+        // Check src1: wait on its producer's tag, or -1 if the value is already ready
+        if (instruction.src[0] != -1)
+            entry.srcTag[0] = registerStatus[instruction.src[0]];
+
+        // Check src2
+        if (instruction.src[1] != -1)
+            entry.srcTag[1] = registerStatus[instruction.src[1]];
+
+        // Update destination’s producer tag (must come after the source checks,
+        // so e.g. R4 = R4 + R1 waits on the previous producer of R4, not itself)
+        if (instruction.dest != -1)
+            registerStatus[instruction.dest] = entry.tag;
+
+        // Push into the chosen structure
+        target->push_back(entry);
+
+        // Pop from instruction queue
+        instructionQueue.pop();
     }
 }
 
@@ -252,7 +276,9 @@ int main()
 
     InstructionQueue instructionQueue;
     ReservationStation reservationStation;
-    
+    LoadQueue loadQueue;
+    StoreQueue storeQueue;
+
     // Tag of the in-flight instruction producing each register, -1 = value is ready
     int registerStatus[128];
     for (int r = 0; r < 128; r++)
@@ -262,9 +288,9 @@ int main()
 
     int width = 4;
     fetchAndDecode(instructionQueue, file, width); // Works perfectly now
-    issue(instructionQueue, reservationStation, width, registerStatus, nextTag);
+    issue(instructionQueue, reservationStation, loadQueue, storeQueue, width, registerStatus, nextTag);
     dispatch(reservationStation);
-    int finished = execute(reservationStation);
+    execute(reservationStation);
     writeBack(reservationStation, registerStatus);
     return 0;
 }
