@@ -6,6 +6,8 @@
 #include <queue>
 #include <unordered_map>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 
 enum class Op { ALU, FPU, LDW, STW, BRA, BUC, BCN, CAL, RET };
@@ -34,6 +36,7 @@ using StoreQueue         = std::vector<RSEntry>;  // capacity 8
 // using Instruction = std::unordered_map<std::string, std::string>;
 using InstructionQueue = std::queue<Instruction>;
 
+const std::size_t IQ_MAX_SIZE = 16;
 const std::size_t RS_MAX_SIZE = 32;
 const std::size_t LQ_MAX_SIZE = 8;
 const std::size_t SQ_MAX_SIZE = 8;
@@ -67,14 +70,22 @@ bool parseOp(const std::string &s, Op &op)
     return true;
 }
 
-void fetchAndDecode(InstructionQueue &instructionQueue, std::ifstream &file, int fetch_len)
+// Fetch and decode up to fetch_len instructions into the instruction queue,
+// stopping early if the queue is full. Returns false once the trace has ended.
+bool fetchAndDecode(InstructionQueue &instructionQueue, std::ifstream &file, int fetch_len)
 {
     std::string line;
+    int fetched = 0;
 
-    for (int i = 0; i < fetch_len && std::getline(file, line); i++)
+    while (fetched < fetch_len && instructionQueue.size() < IQ_MAX_SIZE)
     {
+        if (!std::getline(file, line))
+            return false;
+
+        // Lines that aren't instructions are skipped without using a fetch slot,
+        // since fetched only counts instructions actually pushed
         if (line.empty())
-            continue; // do we need to do i-- here since one itr was wasted?
+            continue;
 
         std::stringstream lineStream(line);
         std::vector<std::string> tokenList;
@@ -119,10 +130,10 @@ void fetchAndDecode(InstructionQueue &instructionQueue, std::ifstream &file, int
         }
 
         instructionQueue.push(instr);
+        fetched++;
     }
 
-    // Optional: Do something with your instructionQueue here!
-    std::cout << "Successfully fetched and decoded instructions.\n";
+    return true;
 }
 
 void issue(InstructionQueue &instructionQueue, ReservationStation &reservationStation,
@@ -284,12 +295,27 @@ void writeBack(ReservationStation &reservationStation, LoadQueue &loadQueue,
     }
 }
 
-int main()
+int main(int argc, char *argv[])
 {
-    std::ifstream file("sample.trace");
+    // Commadn: Pipeline.GrpN <trace file> <width>
+    if (argc != 3)
+    {
+        std::cerr << "usage: " << argv[0] << " <Trace file> <width>\n";
+        return 1;
+    }
+
+    std::ifstream file(argv[1]);
     if (!file.is_open())
     {
-        std::cerr << "Failed to open file!\n";
+        std::cerr << "failed to open file: " << argv[1] << "\n";
+        return 1;
+    }
+
+    // Width of fetch, decode, issue
+    int width = std::atoi(argv[2]);
+    if (width < 1)
+    {
+        std::cerr << "width must be a positive integer\n";
         return 1;
     }
 
@@ -305,15 +331,51 @@ int main()
 
     int nextTag = 1;
 
-    int width = 4;
-    fetchAndDecode(instructionQueue, file, width); // Works perfectly now
-    issue(instructionQueue, reservationStation, loadQueue, storeQueue, width, registerStatus, nextTag);
-    dispatch(reservationStation);
-    dispatch(loadQueue);
-    dispatch(storeQueue);
-    execute(reservationStation);
-    execute(loadQueue);
-    execute(storeQueue);
-    writeBack(reservationStation, loadQueue, storeQueue, registerStatus);
+    // dispatch and execute work on one structure at a time, so loop over all three
+    std::vector<RSEntry> *structures[] = {&reservationStation, &loadQueue, &storeQueue};
+
+    unsigned long cycles = 0;
+    unsigned long totalFinished = 0;   // instructions that finished executing
+    int maxIPC = 0;                    // most instructions finished in one cycle
+    bool traceDone = false;
+
+    while (true)
+    {
+        cycles++;
+
+        // Stages run in reverse order so each instruction advances at most one
+        // stage per cycle (each stage only sees what the stage before it
+        // produced in an earlier cycle)
+        writeBack(reservationStation, loadQueue, storeQueue, registerStatus);
+
+        int finished = 0;
+        for (std::vector<RSEntry> *structure : structures)
+            finished += execute(*structure);
+
+        for (std::vector<RSEntry> *structure : structures)
+            dispatch(*structure);
+
+        issue(instructionQueue, reservationStation, loadQueue, storeQueue, width, registerStatus, nextTag);
+
+        if (!traceDone)
+            traceDone = !fetchAndDecode(instructionQueue, file, width);
+
+        totalFinished += finished;
+        if (finished > maxIPC)
+            maxIPC = finished;
+
+        // Done once the whole trace is read and every structure has drained
+        if (traceDone && instructionQueue.empty() && reservationStation.empty() &&
+            loadQueue.empty() && storeQueue.empty())
+            break;
+    }
+
+    double IPC = (double)totalFinished / cycles;
+
+    printf("Average IPC:\t%.2f\n", IPC);
+    printf("Max IPC:\t%d\n", maxIPC);
+    printf("Total number of cycles:\t%lu\n", cycles);
+    printf("\n");
+
     return 0;
 }
